@@ -2,11 +2,12 @@
 # and: https://github.com/JuliaSmoothOptimizers/NLPModels.jl/blob/main/.github/workflows/breakage.yml
 name: Breakage
 
-# read-only repo token
-# no access to secrets
 on:
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   break:
@@ -14,48 +15,141 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [
-          "JuliaDynamics/ConcurrentSim.jl",
-          "gerlero/Fronts.jl",
-          "QuantumSavory/QuantumSavory.jl",
-          "marcom/FoldRNA.jl",
-          "JuliaAstro/CCDReduction.jl",
-        ]
-        pkgversion: [latest]
+        include:
+          # checks the CI workflow status by default to find last good commit
+          # add a `workflow:` line below `repo:` to use a different workflow name/file
+          - repo: JuliaDynamics/ConcurrentSim.jl
+          - repo: gerlero/Fronts.jl
+          - repo: QuantumSavory/QuantumSavory.jl
+          - repo: marcom/FoldRNA.jl
+          - repo: JuliaAstro/CCDReduction.jl
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout this repo (ResumableFunctions.jl)
+        uses: actions/checkout@v5
 
-      # Install Julia
-      - uses: julia-actions/setup-julia@v1
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v1
         with:
-          version: 1
+          version: '1'
           arch: x64
-      - uses: julia-actions/cache@v2
-      - uses: julia-actions/julia-buildpkg@v1
 
-      # Breakage test
-      - name: 'Breakage of ${{ matrix.pkg }}, ${{ matrix.pkgversion }} version'
+      - name: Cache Julia
+        uses: julia-actions/cache@v2
+
+      # Warm the cache once for this PR
+      - name: Build the PR package once
+        uses: julia-actions/julia-buildpkg@v1
+
+      # Find the last successful run in the target repo (and parse owner/repo_name)
+      - name: Last good commit for ${{ matrix.repo }}
+        id: lastgood
         env:
-          URL: ${{ matrix.pkg }}
-          VERSION: ${{ matrix.pkgversion }}
+          GH_TOKEN: ${{ github.token }}
+          REPO:     ${{ matrix.repo }}
+          WF:       ${{ matrix.workflow }}
+        shell: bash
         run: |
-          set -v
-          mkdir -p ./pr
-          echo "${{ github.event.number }}" > ./pr/NR
-          git clone https://github.com/$URL
-          export PKG=$(echo $URL | cut -f2 -d/)
-          cd $PKG
-          TAG=$VERSION
-          export TAG
-          julia -e 'using Pkg;
-            PKG, TAG, VERSION = ENV["PKG"], ENV["TAG"], ENV["VERSION"]
+          set -euo pipefail
+
+          # Parse owner/repo_name
+          owner="${REPO%%/*}"
+          repo_name="${REPO##*/}"
+
+          # Default branch of target repo
+          default_branch="$(gh api "repos/$owner/$repo_name" --jq .default_branch)"
+
+          # Choose workflow: default to "CI" if not set
+          workflow="${WF:-CI}"
+
+          # Last successful run SHA on default branch
+          sha="$(
+            gh run list -R "$owner/$repo_name" \
+              --workflow "$workflow" \
+              --branch "$default_branch" \
+              --json headSha,conclusion \
+              --limit 50 \
+              --jq '.[] | select(.conclusion=="success") | .headSha' \
+            | head -n1
+          )"
+
+          if [ -z "$sha" ]; then
+            echo "No successful runs found for $owner/$repo_name workflow=$workflow on $default_branch" >&2
+            exit 1
+          fi
+
+          {
+            echo "owner=$owner"
+            echo "repo_name=$repo_name"
+            echo "branch=$default_branch"
+            echo "sha=$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      # Best label for that commit IN THE TARGET REPO: tag → master → sha
+      - name: Pick best label for ${{ matrix.repo }}
+        id: bestlabel
+        env:
+          REPO: ${{ matrix.repo }}
+          SHA:  ${{ steps.lastgood.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$REPO"
+          sha="$SHA"
+
+          # Try annotated tags (peeled ^{}) first, then lightweight tags
+          tag="$(
+            git ls-remote --tags "https://github.com/$repo" \
+            | awk -v s="$sha" '($1==s && $2 ~ /\^\{\}$/){sub(/^refs\/tags\//,"",$2); sub(/\^\{\}$/,"",$2); print $2}' \
+            | head -n1
+          )"
+          if [ -z "$tag" ]; then
+            tag="$(
+              git ls-remote --tags --refs "https://github.com/$repo" \
+              | awk -v s="$sha" '$1==s{sub(/^refs\/tags\//,"",$2); print $2}' \
+              | head -n1
+            )"
+          fi
+
+          if [ -n "$tag" ]; then
+            ref="$tag"
+          else
+            master_sha="$(git ls-remote --heads "https://github.com/$repo" master | awk '{print $1}')"
+            if [ -n "$master_sha" ] && [ "$master_sha" = "$sha" ]; then
+              ref="master"
+            else
+              ref="$sha"
+            fi
+          fi
+
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      # Checkout the reverse dependency at that label into a subfolder
+      - name: Checkout ${{ matrix.repo }} @ ${{ steps.bestlabel.outputs.ref }}
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ steps.bestlabel.outputs.ref }}
+          path: ${{ steps.lastgood.outputs.repo_name }}
+
+      # Test the reverse dependency with this PR dev'ed in
+      - name: Test ${{ matrix.repo }}
+        working-directory: ${{ github.workspace }}/${{ steps.lastgood.outputs.repo_name }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          julia --color=yes --project=. -e '
+            using Pkg
             joburl = joinpath(ENV["GITHUB_SERVER_URL"], ENV["GITHUB_REPOSITORY"], "actions/runs", ENV["GITHUB_RUN_ID"])
-            open("../pr/$PKG-$VERSION", "w") do io
-                TAG == "no_tag" && error("No tag for $VERSION")
-                pkg"activate .";
-                pkg"instantiate";
-                pkg"dev ../";
-                pkg"build";
-                pkg"test";
-            end'
+            # record info (mirrors your original pattern)
+            mkpath(joinpath(pwd(), "..", "pr"))
+            open(joinpath(pwd(), "..", "pr", "$(basename(pwd()))-latest"), "w") do io
+              println(io, "base_label=", "${{ steps.bestlabel.outputs.ref }}")
+              println(io, "job_url=", joburl)
+            end
+            pkg"instantiate"
+            # develop the PR repository (workspace root) as an override
+            Pkg.develop(PackageSpec(path=ENV["GITHUB_WORKSPACE"]))
+            Pkg.resolve()
+            Pkg.test()
+          '
