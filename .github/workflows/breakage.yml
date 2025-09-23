@@ -14,14 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pkg: [
-          "JuliaDynamics/ConcurrentSim.jl",
-          "gerlero/Fronts.jl",
-          "QuantumSavory/QuantumSavory.jl",
-          "marcom/FoldRNA.jl",
-          "JuliaAstro/CCDReduction.jl",
-        ]
-        pkgversion: [latest]
+        include:
+          - pkg: "JuliaDynamics/ConcurrentSim.jl"
+          - pkg: "gerlero/Fronts.jl"
+            pkgrevision: "b8d98120a6a59f96921215295ceb6fb054cb5016"
+          - pkg: "QuantumSavory/QuantumSavory.jl"
+          - pkg: "marcom/FoldRNA.jl"
+          - pkg: "JuliaAstro/CCDReduction.jl"
 
     steps:
       - uses: actions/checkout@v5
@@ -35,27 +34,35 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
 
       # Breakage test
-      - name: 'Breakage of ${{ matrix.pkg }}, ${{ matrix.pkgversion }} version'
+      - name: 'Breakage of ${{ matrix.pkg }}'
         env:
           URL: ${{ matrix.pkg }}
-          VERSION: ${{ matrix.pkgversion }}
+          REV: ${{ matrix.pkgrevision }}
+          JULIA_PKG_PRECOMPILE_AUTO: "0"  # avoid auto-precompile during instantiate; test will precompile as needed
         run: |
+          set -euo pipefail
           set -v
-          mkdir -p ./pr
-          echo "${{ github.event.number }}" > ./pr/NR
-          git clone https://github.com/$URL
-          export PKG=$(echo $URL | cut -f2 -d/)
-          cd $PKG
-          TAG=$VERSION
-          export TAG
-          julia -e 'using Pkg;
-            PKG, TAG, VERSION = ENV["PKG"], ENV["TAG"], ENV["VERSION"]
-            joburl = joinpath(ENV["GITHUB_SERVER_URL"], ENV["GITHUB_REPOSITORY"], "actions/runs", ENV["GITHUB_RUN_ID"])
-            open("../pr/$PKG-$VERSION", "w") do io
-                TAG == "no_tag" && error("No tag for $VERSION")
-                pkg"activate .";
-                pkg"instantiate";
-                pkg"dev ../";
-                pkg"build";
-                pkg"test";
-            end'
+          # Derive folder name (repo name)
+          export PKG=$(echo "$URL" | cut -f2 -d/)
+
+          # Shallow fetch either a specific commit (pkgrevision) or master tip
+          mkdir -p "$PKG"
+          git init "$PKG"
+          cd "$PKG"
+          git remote add origin https://github.com/$URL
+          if [ -n "${REV:-}" ]; then
+            git fetch --depth 1 origin "$REV"
+            git checkout --detach FETCH_HEAD
+          else
+            git fetch --depth 1 origin master
+            git checkout --detach FETCH_HEAD
+          fi
+
+          # Order matters: develop PR first, then instantiate so deps resolve once
+          julia --color=yes -e '
+            using Pkg
+            pkg"activate ."
+            Pkg.develop(PackageSpec(path=ENV["GITHUB_WORKSPACE"]))
+            pkg"instantiate"
+            pkg"build"
+            pkg"test"'
