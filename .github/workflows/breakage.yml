@@ -16,12 +16,11 @@ jobs:
       matrix:
         pkg: [
           "JuliaDynamics/ConcurrentSim.jl",
-          "gerlero/Fronts.jl",
+          #"gerlero/Fronts.jl",  # temporarily disabled until its CI succeeds at least on stable
           "QuantumSavory/QuantumSavory.jl",
           "marcom/FoldRNA.jl",
           "JuliaAstro/CCDReduction.jl",
         ]
-        pkgversion: [latest]
 
     steps:
       - uses: actions/checkout@v5
@@ -35,27 +34,18 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
 
       # Breakage test
-      - name: 'Breakage of ${{ matrix.pkg }}, ${{ matrix.pkgversion }} version'
+      - name: 'Breakage of ${{ matrix.pkg }}, latest version'
         env:
           URL: ${{ matrix.pkg }}
-          VERSION: ${{ matrix.pkgversion }}
         run: |
+          set -euo pipefail
           set -v
-          mkdir -p ./pr
-          echo "${{ github.event.number }}" > ./pr/NR
-          git clone https://github.com/$URL
-          export PKG=$(echo $URL | cut -f2 -d/)
-          cd $PKG
-          TAG=$VERSION
-          export TAG
+          git clone --depth=1 https://github.com/$URL
+          cd "${URL#*/}"
+          
           julia -e 'using Pkg;
-            PKG, TAG, VERSION = ENV["PKG"], ENV["TAG"], ENV["VERSION"]
-            joburl = joinpath(ENV["GITHUB_SERVER_URL"], ENV["GITHUB_REPOSITORY"], "actions/runs", ENV["GITHUB_RUN_ID"])
-            open("../pr/$PKG-$VERSION", "w") do io
-                TAG == "no_tag" && error("No tag for $VERSION")
                 pkg"activate .";
-                pkg"instantiate";
                 pkg"dev ../";
+                pkg"instantiate";
                 pkg"build";
-                pkg"test";
-            end'
+                pkg"test";'
